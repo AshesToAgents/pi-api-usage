@@ -1,0 +1,525 @@
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { Text, matchesKey } from "@mariozechner/pi-tui";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { formatResetTime, formatEpochReset, progressBar, isOAuthKey } from "./format.js";
+
+// ─── Types ───────────────────────────────────────────────────────────────────
+
+type Provider = "anthropic" | "zai";
+
+// Anthropic
+interface AnthropicUsageWindow {
+	utilization: number;
+	resets_at: string | null;
+}
+
+interface AnthropicUsageResponse {
+	five_hour: AnthropicUsageWindow | null;
+	seven_day: AnthropicUsageWindow | null;
+	seven_day_opus: AnthropicUsageWindow | null;
+	seven_day_sonnet: AnthropicUsageWindow | null;
+	extra_usage: {
+		is_enabled: boolean;
+		monthly_limit: number;
+		used_credits: number;
+		utilization: number;
+	} | null;
+}
+
+// Z.ai
+interface ZaiLimit {
+	type: "TOKENS_LIMIT" | "TIME_LIMIT";
+	unit: number;
+	number: number;
+	usage: number;
+	currentValue: number;
+	remaining: number;
+	percentage: number;
+	nextResetTime?: number;
+	usageDetails?: { modelCode: string; usage: number }[];
+}
+
+interface ZaiQuotaResponse {
+	code: number;
+	data: { limits: ZaiLimit[] };
+	success: boolean;
+}
+
+interface ZaiSubscription {
+	productName: string;
+	nextRenewTime: string;
+	status: string;
+	inCurrentPeriod: boolean;
+}
+
+interface ZaiSubscriptionResponse {
+	code: number;
+	data: ZaiSubscription[];
+	success: boolean;
+}
+
+interface ZaiUsageData {
+	session?: { percentage: number; nextResetTime: number };
+	weekly?: { percentage: number; nextResetTime: number };
+	webSearches?: { used: number; limit: number; details: { modelCode: string; usage: number }[] };
+	planName?: string;
+	nextRenewTime?: string;
+}
+
+// Unified
+type UsageData =
+	| { provider: "anthropic"; data: AnthropicUsageResponse }
+	| { provider: "zai"; data: ZaiUsageData };
+
+// ─── Cache / State ───────────────────────────────────────────────────────────
+
+interface CachedUsage {
+	data: UsageData;
+	fetchedAt: number;
+}
+
+const CACHE_DIR = join(process.env.HOME ?? "~", ".pi", "agent", "data");
+const STATUS_KEY = "api-usage";
+const COOLDOWN_MS = 60_000;
+
+const providerState: Record<Provider, {
+	cacheFile: string;
+	lastFetchTime: number;
+	lastData: UsageData | null;
+	lastFetchFailed: boolean;
+}> = {
+	anthropic: {
+		cacheFile: join(CACHE_DIR, "anthropic-usage-cache.json"),
+		lastFetchTime: 0,
+		lastData: null,
+		lastFetchFailed: false,
+	},
+	zai: {
+		cacheFile: join(CACHE_DIR, "zai-usage-cache.json"),
+		lastFetchTime: 0,
+		lastData: null,
+		lastFetchFailed: false,
+	},
+};
+
+function loadCache(provider: Provider): void {
+	const s = providerState[provider];
+	try {
+		const raw = readFileSync(s.cacheFile, "utf-8");
+		const cached: CachedUsage = JSON.parse(raw);
+		s.lastData = cached.data;
+		s.lastFetchTime = cached.fetchedAt;
+	} catch {
+		// No cache or invalid — that's fine
+	}
+}
+
+function saveCache(provider: Provider): void {
+	const s = providerState[provider];
+	if (!s.lastData) return;
+	try {
+		mkdirSync(CACHE_DIR, { recursive: true });
+		writeFileSync(s.cacheFile, JSON.stringify({ data: s.lastData, fetchedAt: s.lastFetchTime } satisfies CachedUsage));
+	} catch {
+		// Non-critical
+	}
+}
+
+// ─── Provider detection ─────────────────────────────────────────────────────
+
+function getProvider(ctx: ExtensionContext): Provider | null {
+	const p = ctx.model?.provider;
+	if (p === "anthropic") return "anthropic";
+	if (p === "zai") return "zai";
+	return null;
+}
+
+// ─── Anthropic fetch ─────────────────────────────────────────────────────────
+
+async function fetchAnthropicUsage(ctx: ExtensionContext, quiet = false): Promise<UsageData | null> {
+	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model!);
+	if (!auth.ok || !auth.apiKey) {
+		if (!quiet) ctx.ui.notify("No API key configured for Anthropic", "warning");
+		providerState.anthropic.lastFetchFailed = true;
+		return null;
+	}
+	if (!isOAuthKey(auth.apiKey)) {
+		if (!quiet) ctx.ui.notify("Usage requires OAuth key (sk-ant-oat-*)", "warning");
+		providerState.anthropic.lastFetchFailed = true;
+		return null;
+	}
+
+	try {
+		const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
+			headers: {
+				Authorization: `Bearer ${auth.apiKey}`,
+				"anthropic-beta": "oauth-2025-04-20",
+				"Content-Type": "application/json",
+			},
+		});
+		if (!res.ok) {
+			if (!quiet) {
+				const msg = res.status === 429 ? "Rate limited while fetching usage" : `Usage fetch failed: HTTP ${res.status}`;
+				ctx.ui.notify(msg, "warning");
+			}
+			providerState.anthropic.lastFetchFailed = true;
+			return null;
+		}
+		providerState.anthropic.lastFetchFailed = false;
+		const data = (await res.json()) as AnthropicUsageResponse;
+		const usage: UsageData = { provider: "anthropic", data };
+		providerState.anthropic.lastData = usage;
+		providerState.anthropic.lastFetchTime = Date.now();
+		saveCache("anthropic");
+		return usage;
+	} catch (e: any) {
+		if (!quiet) ctx.ui.notify(`Usage fetch error: ${e.message}`, "warning");
+		providerState.anthropic.lastFetchFailed = true;
+		return null;
+	}
+}
+
+// ─── Z.ai fetch ──────────────────────────────────────────────────────────────
+
+async function fetchZaiUsage(ctx: ExtensionContext, quiet = false): Promise<UsageData | null> {
+	let apiKey = process.env.ZAI_API_KEY ?? process.env.GLM_API_KEY;
+	if (!apiKey) {
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model!);
+		if (!auth.ok || !auth.apiKey) {
+			if (!quiet) ctx.ui.notify("No ZAI_API_KEY found. Set environment variable first.", "warning");
+			providerState.zai.lastFetchFailed = true;
+			return null;
+		}
+		apiKey = auth.apiKey;
+	}
+
+	const headers = { Authorization: `Bearer ${apiKey}`, Accept: "application/json" };
+
+	try {
+		const [quotaRes, subRes] = await Promise.all([
+			fetch("https://api.z.ai/api/monitor/usage/quota/limit", { headers }),
+			fetch("https://api.z.ai/api/biz/subscription/list", { headers }),
+		]);
+
+		if (!quotaRes.ok) {
+			if (!quiet) {
+				if (quotaRes.status === 401 || quotaRes.status === 403) {
+					ctx.ui.notify("API key invalid. Check your Z.ai API key.", "warning");
+				} else {
+					ctx.ui.notify(`Usage request failed (HTTP ${quotaRes.status}). Try again later.`, "warning");
+				}
+			}
+			providerState.zai.lastFetchFailed = true;
+			return null;
+		}
+
+		providerState.zai.lastFetchFailed = false;
+		const quota = (await quotaRes.json()) as ZaiQuotaResponse;
+
+		let planName: string | undefined;
+		let nextRenewTime: string | undefined;
+		if (subRes.ok) {
+			const sub = (await subRes.json()) as ZaiSubscriptionResponse;
+			const active = sub.data?.find((s) => s.inCurrentPeriod || s.status === "VALID");
+			if (active) {
+				planName = active.productName;
+				nextRenewTime = active.nextRenewTime;
+			}
+		}
+
+		const usageData: ZaiUsageData = {};
+		for (const limit of quota.data?.limits ?? []) {
+			if (limit.type === "TOKENS_LIMIT") {
+				if (limit.unit === 3 && limit.number === 5) {
+					usageData.session = { percentage: limit.percentage, nextResetTime: limit.nextResetTime! };
+				} else if (limit.unit === 6 && limit.number === 7) {
+					usageData.weekly = { percentage: limit.percentage, nextResetTime: limit.nextResetTime! };
+				}
+			} else if (limit.type === "TIME_LIMIT") {
+				usageData.webSearches = {
+					used: limit.currentValue,
+					limit: limit.usage,
+					details: limit.usageDetails ?? [],
+				};
+			}
+		}
+		usageData.planName = planName;
+		usageData.nextRenewTime = nextRenewTime;
+
+		const result: UsageData = { provider: "zai", data: usageData };
+		providerState.zai.lastData = result;
+		providerState.zai.lastFetchTime = Date.now();
+		saveCache("zai");
+		return result;
+	} catch (e: any) {
+		if (!quiet) ctx.ui.notify(`Usage fetch error: ${e.message}`, "warning");
+		providerState.zai.lastFetchFailed = true;
+		return null;
+	}
+}
+
+// ─── Unified fetch ───────────────────────────────────────────────────────────
+
+async function fetchUsage(ctx: ExtensionContext, quiet = false): Promise<UsageData | null> {
+	const provider = getProvider(ctx);
+	if (provider === "anthropic") return fetchAnthropicUsage(ctx, quiet);
+	if (provider === "zai") return fetchZaiUsage(ctx, quiet);
+	return null;
+}
+
+// ─── Display helpers ─────────────────────────────────────────────────────────
+
+function colorForPct(pct: number, theme: any): (text: string) => string {
+	if (pct > 80) return (t: string) => theme.fg("error", t);
+	if (pct >= 50) return (t: string) => theme.fg("warning", t);
+	return (t: string) => theme.fg("success", t);
+}
+
+// ─── Status bar line ─────────────────────────────────────────────────────────
+
+function anthropicStatusLine(data: AnthropicUsageResponse, theme: any): string[] {
+	const parts: string[] = [];
+	if (data.five_hour) {
+		const pct = Math.round(data.five_hour.utilization);
+		parts.push(colorForPct(pct, theme)(`5hr: ${pct}%`));
+	}
+	if (data.seven_day) {
+		const pct = Math.round(data.seven_day.utilization);
+		parts.push(colorForPct(pct, theme)(`7d: ${pct}%`));
+	}
+	if (parts.length === 0) return [];
+	let line = `Usage: ${parts.join(theme.fg("dim", " │ "))}`;
+	if (providerState.anthropic.lastFetchFailed) line += theme.fg("dim", " (cached)");
+	return [line];
+}
+
+function zaiStatusLine(data: ZaiUsageData, theme: any): string[] {
+	const parts: string[] = [];
+	if (data.session) {
+		const pct = Math.round(data.session.percentage);
+		parts.push(colorForPct(pct, theme)(`5hr: ${pct}%`));
+	}
+	if (data.weekly) {
+		const pct = Math.round(data.weekly.percentage);
+		parts.push(colorForPct(pct, theme)(`7d: ${pct}%`));
+	}
+	if (parts.length === 0) return [];
+	let line = `Usage: ${parts.join(theme.fg("dim", " │ "))}`;
+	if (providerState.zai.lastFetchFailed) line += theme.fg("dim", " (cached)");
+	return [line];
+}
+
+function statusLine(usage: UsageData, theme: any): string[] {
+	if (usage.provider === "anthropic") return anthropicStatusLine(usage.data as AnthropicUsageResponse, theme);
+	return zaiStatusLine(usage.data as ZaiUsageData, theme);
+}
+
+// ─── Status update ───────────────────────────────────────────────────────────
+
+function updateStatus(ctx: ExtensionContext) {
+	if (!ctx.hasUI) return;
+	const provider = getProvider(ctx);
+	if (!provider) {
+		ctx.ui.setStatus(STATUS_KEY, undefined);
+		return;
+	}
+	const s = providerState[provider];
+	if (!s.lastData) {
+		ctx.ui.setStatus(STATUS_KEY, undefined);
+		return;
+	}
+	const theme = ctx.ui.theme;
+	const lines = statusLine(s.lastData, theme);
+	ctx.ui.setStatus(STATUS_KEY, lines.length > 0 ? lines[0] : undefined);
+}
+
+async function fetchAndUpdateStatus(ctx: ExtensionContext, forceFetch = false) {
+	const provider = getProvider(ctx);
+	if (!provider) {
+		ctx.ui.setStatus(STATUS_KEY, undefined);
+		return;
+	}
+	const s = providerState[provider];
+	if (!forceFetch && Date.now() - s.lastFetchTime < COOLDOWN_MS && s.lastData) {
+		updateStatus(ctx);
+		return;
+	}
+	const data = await fetchUsage(ctx, true);
+	if (data) {
+		updateStatus(ctx);
+	} else if (s.lastData) {
+		updateStatus(ctx);
+	}
+}
+
+// ─── /usage command renderers ────────────────────────────────────────────────
+
+function renderAnthropicDetail(data: AnthropicUsageResponse, theme: any, isStale: boolean): string[] {
+	const lines: string[] = [];
+
+	let title = theme.bold(theme.fg("accent", "Anthropic API Usage"));
+	if (isStale) {
+		const ago = Math.round((Date.now() - providerState.anthropic.lastFetchTime) / 60_000);
+		title += theme.fg("dim", `  (cached ${ago}m ago)`);
+	}
+	lines.push(title);
+	lines.push(theme.fg("dim", "─".repeat(30)));
+
+	if (data.five_hour) {
+		const pct = Math.round(data.five_hour.utilization);
+		const color = colorForPct(pct, theme);
+		const bar = color(progressBar(pct));
+		const reset = theme.fg("dim", formatResetTime(data.five_hour.resets_at));
+		lines.push(`5-Hour:   ${bar}  ${color(pct + "%")}  ${reset}`);
+	}
+	if (data.seven_day) {
+		const pct = Math.round(data.seven_day.utilization);
+		const color = colorForPct(pct, theme);
+		const bar = color(progressBar(pct));
+		const reset = theme.fg("dim", formatResetTime(data.seven_day.resets_at));
+		lines.push(`7-Day:    ${bar}  ${color(pct + "%")}  ${reset}`);
+	}
+	if (data.seven_day_sonnet) {
+		const pct = Math.round(data.seven_day_sonnet.utilization);
+		const color = colorForPct(pct, theme);
+		const bar = color(progressBar(pct));
+		const reset = theme.fg("dim", formatResetTime(data.seven_day_sonnet.resets_at));
+		lines.push(`Sonnet:   ${bar}  ${color(pct + "%")}  ${reset}`);
+	}
+	if (data.seven_day_opus) {
+		const pct = Math.round(data.seven_day_opus.utilization);
+		const color = colorForPct(pct, theme);
+		const bar = color(progressBar(pct));
+		const reset = theme.fg("dim", formatResetTime(data.seven_day_opus.resets_at));
+		lines.push(`Opus:     ${bar}  ${color(pct + "%")}  ${reset}`);
+	}
+	if (data.extra_usage) {
+		const used = data.extra_usage.used_credits ?? 0;
+		const limit = data.extra_usage.monthly_limit ?? 0;
+		const enabled = data.extra_usage.is_enabled;
+		const label = enabled
+			? theme.fg("muted", `$${used.toFixed(2)} / $${limit.toFixed(2)}`)
+			: theme.fg("dim", "disabled");
+		lines.push(`Extra:    ${label}`);
+	}
+
+	return lines;
+}
+
+function renderZaiDetail(data: ZaiUsageData, theme: any, isStale: boolean): string[] {
+	const lines: string[] = [];
+
+	let title = theme.bold(theme.fg("accent", "Z.ai API Usage"));
+	if (data.planName) title += theme.fg("dim", `  (${data.planName})`);
+	if (isStale) {
+		const ago = Math.round((Date.now() - providerState.zai.lastFetchTime) / 60_000);
+		title += theme.fg("dim", `  (cached ${ago}m ago)`);
+	}
+	lines.push(title);
+	lines.push(theme.fg("dim", "─".repeat(30)));
+
+	if (data.session) {
+		const pct = Math.round(data.session.percentage);
+		const color = colorForPct(pct, theme);
+		const bar = color(progressBar(pct));
+		const reset = theme.fg("dim", formatEpochReset(data.session.nextResetTime));
+		lines.push(`Session:  ${bar}  ${color(pct + "%")}  ${reset}`);
+	}
+	if (data.weekly) {
+		const pct = Math.round(data.weekly.percentage);
+		const color = colorForPct(pct, theme);
+		const bar = color(progressBar(pct));
+		const reset = theme.fg("dim", formatEpochReset(data.weekly.nextResetTime));
+		lines.push(`Weekly:   ${bar}  ${color(pct + "%")}  ${reset}`);
+	}
+	if (data.webSearches) {
+		const ws = data.webSearches;
+		const pct = ws.limit > 0 ? Math.round((ws.used / ws.limit) * 100) : 0;
+		const color = colorForPct(pct, theme);
+		const count = theme.fg("muted", `${ws.used.toLocaleString()} / ${ws.limit.toLocaleString()}`);
+		let resetLabel = "";
+		if (data.nextRenewTime) {
+			resetLabel = theme.fg("dim", `(resets ${new Date(data.nextRenewTime).toLocaleDateString([], { month: "short", day: "numeric" })})`);
+		}
+		lines.push(`Searches: ${color(progressBar(pct))}  ${count}  ${resetLabel}`);
+	}
+
+	return lines;
+}
+
+// ─── Extension entry point ───────────────────────────────────────────────────
+
+export default function (pi: ExtensionAPI) {
+	loadCache("anthropic");
+	loadCache("zai");
+
+	// /usage command — rich display
+	pi.registerCommand("usage", {
+		description: "Show API usage and rate limits for the current provider",
+		handler: async (_args, ctx) => {
+			const provider = getProvider(ctx);
+			if (!provider) {
+				ctx.ui.notify("Usage tracking only supports Anthropic and Z.ai models", "warning");
+				return;
+			}
+
+			const data = await fetchUsage(ctx);
+			const s = providerState[provider];
+			if (!data && !s.lastData) return;
+
+			const displayData = data ?? s.lastData!;
+			const isStale = !data && !!s.lastData;
+
+			updateStatus(ctx);
+
+			await ctx.ui.custom<void>((tui, theme, _kb, done) => {
+				let lines: string[];
+				if (displayData.provider === "anthropic") {
+					lines = renderAnthropicDetail(displayData.data as AnthropicUsageResponse, theme, isStale);
+				} else {
+					lines = renderZaiDetail(displayData.data as ZaiUsageData, theme, isStale);
+				}
+				lines.push("");
+				lines.push(theme.fg("dim", "Press Escape to close"));
+
+				const text = new Text(lines.join("\n"), 1, 1);
+				return {
+					render: (width: number) => text.render(width),
+					invalidate: () => text.invalidate(),
+					handleInput: (data: string) => {
+						if (matchesKey(data, "escape") || matchesKey(data, "enter") || data === "q") {
+							done();
+						}
+					},
+				};
+			});
+		},
+	});
+
+	// Session start — show cached status immediately, then try to fetch fresh
+	pi.on("session_start", async (_event, ctx) => {
+		const provider = getProvider(ctx);
+		if (provider) {
+			if (providerState[provider].lastData) updateStatus(ctx);
+			await fetchAndUpdateStatus(ctx, true);
+		}
+	});
+
+	// Agent end — refresh status with cooldown
+	pi.on("agent_end", async (_event, ctx) => {
+		const provider = getProvider(ctx);
+		if (provider) {
+			await fetchAndUpdateStatus(ctx);
+		}
+	});
+
+	// Model select — show/hide status
+	pi.on("model_select", async (event, ctx) => {
+		if (event.model.provider === "anthropic" || event.model.provider === "zai") {
+			await fetchAndUpdateStatus(ctx);
+		} else {
+			ctx.ui.setStatus(STATUS_KEY, undefined);
+		}
+	});
+}
