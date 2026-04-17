@@ -1,6 +1,26 @@
 # pi-api-usage
 
-A [pi](https://github.com/mariozechner/pi-coding-agent) package that displays API usage and rate limit information in the status bar, with a detailed `/usage` command.
+A [pi](https://github.com/mariozechner/pi-coding-agent) extension that displays API usage and rate limit information in the status bar, with a detailed `/usage` command.
+
+## Install
+
+```bash
+# Global (user-level)
+pi install ssh://git@github.com/SunflowerFuchs/pi-api-usage.git
+
+# Project-level (shared with team via .pi/settings.json)
+pi install -l ssh://git@github.com/SunflowerFuchs/pi-api-usage.git
+
+# Try without installing
+pi -e ssh://git@github.com/SunflowerFuchs/pi-api-usage.git
+```
+
+## What's Included
+
+| Type | Name | Description |
+|------|------|-------------|
+| Extension | — | Status bar usage summary with automatic updates |
+| Command | `/usage` | Detailed API usage breakdown with progress bars and reset times |
 
 ## Supported Providers
 
@@ -9,18 +29,7 @@ A [pi](https://github.com/mariozechner/pi-coding-agent) package that displays AP
 | **Anthropic** | 5-hour and 7-day utilization, per-model breakdowns (Sonnet/Opus), extra usage credits |
 | **Z.ai** | Session and weekly token limits, web search quota, plan name and renewal date |
 
-## Installation
-
-Add this package to your pi agent configuration (e.g. in `~/.pi/agent/pi.yaml`):
-
-```yaml
-packages:
-  - path: /path/to/pi-api-usage
-```
-
-Or install via the pi package system if published.
-
-## Features
+## Usage
 
 ### Status Bar
 
@@ -32,7 +41,7 @@ Shows a compact usage summary that updates automatically:
 
 Usage is color-coded: 🟢 green when under 50%, 🟡 yellow at 50%+, 🔴 red above 80%.
 
-### `/usage` Command
+### `/usage`
 
 Run `/usage` in the pi TUI to see a detailed breakdown with progress bars and reset times:
 
@@ -47,17 +56,18 @@ Opus:     ▓▓▓▓▓▓▓░░░  72%  (resets Wed, 2:30 PM)
 Press Escape to close
 ```
 
-### Caching
+## How It Works
 
 Usage data is cached to disk (`~/.pi/agent/data/`) so it survives restarts. If a fresh fetch fails, the last known data is displayed with a "(cached)" indicator.
 
 ## Development
 
 ```bash
-npm run typecheck   # Type-check the project
-npm test            # Run tests with Vitest
+npm install
+npm run typecheck
+npm test
 ```
 
 ## License
 
-Private package.
+MIT
