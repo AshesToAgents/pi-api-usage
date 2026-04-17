@@ -313,7 +313,7 @@ async function fetchZaiUsage(ctx: ExtensionContext, quiet = false): Promise<Usag
 			if (limit.type === "TOKENS_LIMIT") {
 				if (limit.unit === 3 && limit.number === 5) {
 					usageData.session = { percentage: limit.percentage, nextResetTime: limit.nextResetTime! };
-				} else if (limit.unit === 6 && limit.number === 7) {
+				} else if (limit.unit === 6) {
 					usageData.weekly = { percentage: limit.percentage, nextResetTime: limit.nextResetTime! };
 				}
 			} else if (limit.type === "TIME_LIMIT") {
