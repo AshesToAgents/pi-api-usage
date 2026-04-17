@@ -171,6 +171,50 @@ function getProvider(ctx: ExtensionContext): Provider | null {
 	return null;
 }
 
+// ─── Header-based usage extraction ───────────────────────────────────────────
+
+/**
+ * Attempt to extract usage data from provider response headers.
+ * Returns a UsageData if sufficient headers are present, or null if headers
+ * don't contain enough information (fallback to fetch-based approach).
+ *
+ * Headers are normalized to lowercase by the pi extension system.
+ */
+function extractUsageFromHeaders(provider: Provider, headers: Record<string, string>): UsageData | null {
+	if (provider === "anthropic") return extractAnthropicHeaders(headers);
+	// MiniMax and Z.ai don't expose enough header data for percentage-based status
+	return null;
+}
+
+function extractAnthropicHeaders(headers: Record<string, string>): UsageData | null {
+	const get = (key: string) => headers[key];
+
+	// Anthropic unified rate-limit headers (Claude Max / OAuth plans)
+	const util5h = get("anthropic-ratelimit-unified-5h-utilization");
+	const reset5h = get("anthropic-ratelimit-unified-5h-reset");
+	const util7d = get("anthropic-ratelimit-unified-7d-utilization");
+	const reset7d = get("anthropic-ratelimit-unified-7d-reset");
+
+	const hasUnified = util5h != null || util7d != null;
+
+	if (hasUnified) {
+		const data: AnthropicUsageResponse = {
+			five_hour: util5h != null
+				? { utilization: parseFloat(util5h), resets_at: reset5h ? new Date(parseFloat(reset5h) * 1000).toISOString() : null }
+				: null,
+			seven_day: util7d != null
+				? { utilization: parseFloat(util7d), resets_at: reset7d ? new Date(parseFloat(reset7d) * 1000).toISOString() : null }
+				: null,
+			seven_day_opus: null,
+			seven_day_sonnet: null,
+			extra_usage: null,
+		};
+		return { provider: "anthropic", data };
+	}
+
+	return null;
+}
+
 // ─── Anthropic fetch ─────────────────────────────────────────────────────────
 
 async function fetchAnthropicUsage(ctx: ExtensionContext, quiet = false): Promise<UsageData | null> {
@@ -665,6 +709,25 @@ export default function (pi: ExtensionAPI) {
 		if (provider) {
 			await fetchAndUpdateStatus(ctx);
 		}
+	});
+
+	// After provider response — capture rate-limit headers to update status bar
+	pi.on("after_provider_response", async (event, ctx) => {
+		const provider = getProvider(ctx);
+		if (!provider) return;
+
+		// Only process successful responses
+		if (event.status >= 400) return;
+
+		const extracted = extractUsageFromHeaders(provider, event.headers);
+		if (!extracted) return;
+
+		const s = providerState[provider];
+		s.lastData = extracted;
+		s.lastFetchTime = Date.now();
+		s.lastFetchFailed = false;
+		saveCache(provider);
+		updateStatus(ctx);
 	});
 
 	// Model select — show/hide status
