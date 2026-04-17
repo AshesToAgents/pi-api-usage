@@ -334,17 +334,19 @@ async function fetchMiniMaxUsage(ctx: ExtensionContext, quiet = false): Promise<
 
 		const usageData: MiniMaxUsageData = {};
 		if (entry) {
-			if (entry.current_interval_total_count > 0) {
-				usageData.interval = {
-					pct: Math.round((entry.current_interval_usage_count / entry.current_interval_total_count) * 100),
-					resetsAt: entry.end_time,
-				};
-			}
-			if (entry.current_weekly_total_count > 0) {
-				usageData.weekly = {
-					pct: Math.round((entry.current_weekly_usage_count / entry.current_weekly_total_count) * 100),
-					resetsAt: entry.weekly_end_time,
-				};
+				if (entry.current_interval_total_count > 0) {
+					const remaining = entry.current_interval_usage_count / entry.current_interval_total_count;
+					usageData.interval = {
+						pct: Math.round((1 - remaining) * 100),
+						resetsAt: entry.end_time,
+					};
+				}
+				if (entry.current_weekly_total_count > 0) {
+					const remaining = entry.current_weekly_usage_count / entry.current_weekly_total_count;
+					usageData.weekly = {
+						pct: Math.round((1 - remaining) * 100),
+						resetsAt: entry.weekly_end_time,
+					};
 			}
 		}
 
