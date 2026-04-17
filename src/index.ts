@@ -6,7 +6,7 @@ import { formatResetTime, formatEpochReset, progressBar, isOAuthKey } from "./fo
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-type Provider = "anthropic" | "zai";
+type Provider = "anthropic" | "zai" | "minimax";
 
 // Anthropic
 interface AnthropicUsageWindow {
@@ -25,6 +25,34 @@ interface AnthropicUsageResponse {
 		used_credits: number;
 		utilization: number;
 	} | null;
+}
+
+// MiniMax
+interface MiniMaxModelRemain {
+	start_time: number;
+	end_time: number;
+	remains_time: number;
+	current_interval_total_count: number;
+	current_interval_usage_count: number;
+	model_name: string;
+	current_weekly_total_count: number;
+	current_weekly_usage_count: number;
+	weekly_start_time: number;
+	weekly_end_time: number;
+	weekly_remains_time: number;
+}
+
+interface MiniMaxUsageResponse {
+	model_remains: MiniMaxModelRemain[];
+	base_resp: {
+		status_code: number;
+		status_msg: string;
+	};
+}
+
+interface MiniMaxUsageData {
+	interval?: { pct: number; resetsAt: number };
+	weekly?: { pct: number; resetsAt: number };
 }
 
 // Z.ai
@@ -70,7 +98,8 @@ interface ZaiUsageData {
 // Unified
 type UsageData =
 	| { provider: "anthropic"; data: AnthropicUsageResponse }
-	| { provider: "zai"; data: ZaiUsageData };
+	| { provider: "zai"; data: ZaiUsageData }
+	| { provider: "minimax"; data: MiniMaxUsageData };
 
 // ─── Cache / State ───────────────────────────────────────────────────────────
 
@@ -97,6 +126,12 @@ const providerState: Record<Provider, {
 	},
 	zai: {
 		cacheFile: join(CACHE_DIR, "zai-usage-cache.json"),
+		lastFetchTime: 0,
+		lastData: null,
+		lastFetchFailed: false,
+	},
+	minimax: {
+		cacheFile: join(CACHE_DIR, "minimax-usage-cache.json"),
 		lastFetchTime: 0,
 		lastData: null,
 		lastFetchFailed: false,
@@ -132,6 +167,7 @@ function getProvider(ctx: ExtensionContext): Provider | null {
 	const p = ctx.model?.provider;
 	if (p === "anthropic") return "anthropic";
 	if (p === "zai") return "zai";
+	if (p === "minimax") return "minimax";
 	return null;
 }
 
@@ -259,12 +295,78 @@ async function fetchZaiUsage(ctx: ExtensionContext, quiet = false): Promise<Usag
 	}
 }
 
+// ─── MiniMax fetch ───────────────────────────────────────────────────────────
+
+async function fetchMiniMaxUsage(ctx: ExtensionContext, quiet = false): Promise<UsageData | null> {
+	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model!);
+	if (!auth.ok || !auth.apiKey) {
+		if (!quiet) ctx.ui.notify("No API key configured for MiniMax", "warning");
+		providerState.minimax.lastFetchFailed = true;
+		return null;
+	}
+
+	try {
+		const res = await fetch("https://api.minimax.io/v1/api/openplatform/coding_plan/remains", {
+			headers: {
+				Authorization: `Bearer ${auth.apiKey}`,
+				Accept: "application/json",
+			},
+		});
+
+		if (!res.ok) {
+			if (!quiet) {
+				const msg = res.status === 429
+					? "Rate limited while fetching usage"
+					: `Usage fetch failed: HTTP ${res.status}`;
+				ctx.ui.notify(msg, "warning");
+			}
+			providerState.minimax.lastFetchFailed = true;
+			return null;
+		}
+
+		providerState.minimax.lastFetchFailed = false;
+		const body = (await res.json()) as MiniMaxUsageResponse;
+
+		// Only care about MiniMax-M* text model entries
+		const entry = body.model_remains?.find(
+			(m) => m.model_name.startsWith("MiniMax-M"),
+		);
+
+		const usageData: MiniMaxUsageData = {};
+		if (entry) {
+			if (entry.current_interval_total_count > 0) {
+				usageData.interval = {
+					pct: Math.round((entry.current_interval_usage_count / entry.current_interval_total_count) * 100),
+					resetsAt: entry.end_time,
+				};
+			}
+			if (entry.current_weekly_total_count > 0) {
+				usageData.weekly = {
+					pct: Math.round((entry.current_weekly_usage_count / entry.current_weekly_total_count) * 100),
+					resetsAt: entry.weekly_end_time,
+				};
+			}
+		}
+
+		const result: UsageData = { provider: "minimax", data: usageData };
+		providerState.minimax.lastData = result;
+		providerState.minimax.lastFetchTime = Date.now();
+		saveCache("minimax");
+		return result;
+	} catch (e: any) {
+		if (!quiet) ctx.ui.notify(`Usage fetch error: ${e.message}`, "warning");
+		providerState.minimax.lastFetchFailed = true;
+		return null;
+	}
+}
+
 // ─── Unified fetch ───────────────────────────────────────────────────────────
 
 async function fetchUsage(ctx: ExtensionContext, quiet = false): Promise<UsageData | null> {
 	const provider = getProvider(ctx);
 	if (provider === "anthropic") return fetchAnthropicUsage(ctx, quiet);
 	if (provider === "zai") return fetchZaiUsage(ctx, quiet);
+	if (provider === "minimax") return fetchMiniMaxUsage(ctx, quiet);
 	return null;
 }
 
@@ -294,6 +396,22 @@ function anthropicStatusLine(data: AnthropicUsageResponse, theme: any): string[]
 	return [line];
 }
 
+function minimaxStatusLine(data: MiniMaxUsageData, theme: any): string[] {
+	const parts: string[] = [];
+	if (data.interval) {
+		const pct = data.interval.pct;
+		parts.push(colorForPct(pct, theme)(`5hr: ${pct}%`));
+	}
+	if (data.weekly) {
+		const pct = data.weekly.pct;
+		parts.push(colorForPct(pct, theme)(`7d: ${pct}%`));
+	}
+	if (parts.length === 0) return [];
+	let line = `Usage: ${parts.join(theme.fg("dim", " │ "))}`;
+	if (providerState.minimax.lastFetchFailed) line += theme.fg("dim", " (cached)");
+	return [line];
+}
+
 function zaiStatusLine(data: ZaiUsageData, theme: any): string[] {
 	const parts: string[] = [];
 	if (data.session) {
@@ -312,6 +430,7 @@ function zaiStatusLine(data: ZaiUsageData, theme: any): string[] {
 
 function statusLine(usage: UsageData, theme: any): string[] {
 	if (usage.provider === "anthropic") return anthropicStatusLine(usage.data as AnthropicUsageResponse, theme);
+	if (usage.provider === "minimax") return minimaxStatusLine(usage.data as MiniMaxUsageData, theme);
 	return zaiStatusLine(usage.data as ZaiUsageData, theme);
 }
 
@@ -448,11 +567,41 @@ function renderZaiDetail(data: ZaiUsageData, theme: any, isStale: boolean): stri
 	return lines;
 }
 
+function renderMiniMaxDetail(data: MiniMaxUsageData, theme: any, isStale: boolean): string[] {
+	const lines: string[] = [];
+
+	let title = theme.bold(theme.fg("accent", "MiniMax API Usage"));
+	if (isStale) {
+		const ago = Math.round((Date.now() - providerState.minimax.lastFetchTime) / 60_000);
+		title += theme.fg("dim", `  (cached ${ago}m ago)`);
+	}
+	lines.push(title);
+	lines.push(theme.fg("dim", "─".repeat(30)));
+
+	if (data.interval) {
+		const pct = data.interval.pct;
+		const color = colorForPct(pct, theme);
+		const bar = color(progressBar(pct));
+		const reset = theme.fg("dim", formatEpochReset(data.interval.resetsAt));
+		lines.push(`Interval: ${bar}  ${color(pct + "%")}  ${reset}`);
+	}
+	if (data.weekly) {
+		const pct = data.weekly.pct;
+		const color = colorForPct(pct, theme);
+		const bar = color(progressBar(pct));
+		const reset = theme.fg("dim", formatEpochReset(data.weekly.resetsAt));
+		lines.push(`Weekly:   ${bar}  ${color(pct + "%")}  ${reset}`);
+	}
+
+	return lines;
+}
+
 // ─── Extension entry point ───────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
 	loadCache("anthropic");
 	loadCache("zai");
+	loadCache("minimax");
 
 	// /usage command — rich display
 	pi.registerCommand("usage", {
@@ -460,7 +609,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			const provider = getProvider(ctx);
 			if (!provider) {
-				ctx.ui.notify("Usage tracking only supports Anthropic and Z.ai models", "warning");
+				ctx.ui.notify("Usage tracking only supports Anthropic, Z.ai, and MiniMax models", "warning");
 				return;
 			}
 
@@ -477,6 +626,8 @@ export default function (pi: ExtensionAPI) {
 				let lines: string[];
 				if (displayData.provider === "anthropic") {
 					lines = renderAnthropicDetail(displayData.data as AnthropicUsageResponse, theme, isStale);
+				} else if (displayData.provider === "minimax") {
+					lines = renderMiniMaxDetail(displayData.data as MiniMaxUsageData, theme, isStale);
 				} else {
 					lines = renderZaiDetail(displayData.data as ZaiUsageData, theme, isStale);
 				}
@@ -516,7 +667,7 @@ export default function (pi: ExtensionAPI) {
 
 	// Model select — show/hide status
 	pi.on("model_select", async (event, ctx) => {
-		if (event.model.provider === "anthropic" || event.model.provider === "zai") {
+		if (event.model.provider === "anthropic" || event.model.provider === "zai" || event.model.provider === "minimax") {
 			await fetchAndUpdateStatus(ctx);
 		} else {
 			ctx.ui.setStatus(STATUS_KEY, undefined);
