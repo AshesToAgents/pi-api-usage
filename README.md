@@ -1,6 +1,6 @@
 # pi-api-usage
 
-A [pi](https://github.com/mariozechner/pi-coding-agent) extension that displays API usage and rate limit information in the status bar, with a detailed `/usage` command.
+A [pi](https://github.com/earendil-works/pi) extension that displays API usage and rate limit information in the status bar, with a detailed `/usage` command.
 
 ## Install
 
