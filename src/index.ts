@@ -4,10 +4,19 @@ import { Text, matchesKey } from "@earendil-works/pi-tui";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { formatResetTime, formatEpochReset, progressBar, isOAuthKey } from "./format.js";
+import {
+	canUseOpenAICache,
+	getOpenAIAccountId,
+	getOpenAIUsageEndpoint,
+	isOpenAIUsageEligible,
+	parseOpenAIUsage,
+	parseOpenAIUsageHeaders,
+	type OpenAIUsageData,
+} from "./openai.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-type Provider = "anthropic" | "zai" | "minimax";
+type Provider = "anthropic" | "zai" | "minimax" | "openai";
 
 // Anthropic
 interface AnthropicUsageWindow {
@@ -100,13 +109,15 @@ interface ZaiUsageData {
 type UsageData =
 	| { provider: "anthropic"; data: AnthropicUsageResponse }
 	| { provider: "zai"; data: ZaiUsageData }
-	| { provider: "minimax"; data: MiniMaxUsageData };
+	| { provider: "minimax"; data: MiniMaxUsageData }
+	| { provider: "openai"; data: OpenAIUsageData };
 
 // ─── Cache / State ───────────────────────────────────────────────────────────
 
 interface CachedUsage {
 	data: UsageData;
 	fetchedAt: number;
+	accountId?: string;
 }
 
 const CACHE_DIR = join(process.env.HOME ?? "~", ".pi", "agent", "data");
@@ -118,6 +129,7 @@ const providerState: Record<Provider, {
 	lastFetchTime: number;
 	lastData: UsageData | null;
 	lastFetchFailed: boolean;
+	lastAccountId?: string;
 }> = {
 	anthropic: {
 		cacheFile: join(CACHE_DIR, "anthropic-usage-cache.json"),
@@ -137,6 +149,12 @@ const providerState: Record<Provider, {
 		lastData: null,
 		lastFetchFailed: false,
 	},
+	openai: {
+		cacheFile: join(CACHE_DIR, "openai-usage-cache.json"),
+		lastFetchTime: 0,
+		lastData: null,
+		lastFetchFailed: false,
+	},
 };
 
 function loadCache(provider: Provider): void {
@@ -146,6 +164,7 @@ function loadCache(provider: Provider): void {
 		const cached: CachedUsage = JSON.parse(raw);
 		s.lastData = cached.data;
 		s.lastFetchTime = cached.fetchedAt;
+		s.lastAccountId = cached.accountId;
 	} catch {
 		// No cache or invalid — that's fine
 	}
@@ -156,7 +175,11 @@ function saveCache(provider: Provider): void {
 	if (!s.lastData) return;
 	try {
 		mkdirSync(CACHE_DIR, { recursive: true });
-		writeFileSync(s.cacheFile, JSON.stringify({ data: s.lastData, fetchedAt: s.lastFetchTime } satisfies CachedUsage));
+		writeFileSync(s.cacheFile, JSON.stringify({
+			data: s.lastData,
+			fetchedAt: s.lastFetchTime,
+			...(s.lastAccountId ? { accountId: s.lastAccountId } : {}),
+		} satisfies CachedUsage));
 	} catch {
 		// Non-critical
 	}
@@ -164,21 +187,61 @@ function saveCache(provider: Provider): void {
 
 // ─── Provider detection ─────────────────────────────────────────────────────
 
-const SUPPORTED_PROVIDERS: Provider[] = ["anthropic", "zai", "minimax"];
+const SUPPORTED_PROVIDERS: Provider[] = ["anthropic", "zai", "minimax", "openai"];
+
+function isOpenAIProvider(provider: string): boolean {
+	return provider === "openai" || provider === "openai-codex";
+}
+
+function isOpenAISubscriptionModel(ctx: ExtensionContext, model: Model<any>): boolean {
+	return isOpenAIUsageEligible(model.provider, ctx.modelRegistry.isUsingOAuth(model));
+}
+
+function findOpenAISubscriptionModel(ctx: ExtensionContext): Model<any> | undefined {
+	const available = ctx.modelRegistry.getAvailable();
+	const current = ctx.model;
+	if (current && isOpenAISubscriptionModel(ctx, current)) return current;
+
+	return available.find(m => m.provider === "openai-codex" && isOpenAISubscriptionModel(ctx, m))
+		?? available.find(m => m.provider === "openai" && isOpenAISubscriptionModel(ctx, m));
+}
 
 function getActiveProviders(ctx: ExtensionContext): Provider[] {
 	const available = ctx.modelRegistry.getAvailable();
-	return SUPPORTED_PROVIDERS.filter(p => available.some(m => m.provider === p));
+	return SUPPORTED_PROVIDERS.filter(p => p === "openai"
+		? available.some(m => isOpenAISubscriptionModel(ctx, m))
+		: available.some(m => m.provider === p));
 }
 
 function getCurrentProvider(ctx: ExtensionContext): Provider | null {
 	const p = ctx.model?.provider;
+	if (isOpenAIProvider(p ?? "")) return "openai";
 	if (SUPPORTED_PROVIDERS.includes(p as Provider)) return p as Provider;
 	return null;
 }
 
 function findModelForProvider(ctx: ExtensionContext, provider: Provider): Model<any> | undefined {
+	if (provider === "openai") return findOpenAISubscriptionModel(ctx);
 	return ctx.modelRegistry.getAvailable().find(m => m.provider === provider);
+}
+
+async function prepareOpenAICache(ctx: ExtensionContext): Promise<void> {
+	const state = providerState.openai;
+	const model = findOpenAISubscriptionModel(ctx);
+	let currentAccountId: string | undefined;
+	if (model) {
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+		if (auth.ok && auth.apiKey && ctx.modelRegistry.isUsingOAuth(model)) {
+			currentAccountId = getOpenAIAccountId(auth.apiKey);
+		}
+	}
+
+	if (state.lastData && !canUseOpenAICache(state.lastAccountId, currentAccountId)) {
+		state.lastData = null;
+		state.lastFetchTime = 0;
+		state.lastFetchFailed = false;
+	}
+	state.lastAccountId = currentAccountId;
 }
 
 // ─── Header-based usage extraction ───────────────────────────────────────────
@@ -192,6 +255,10 @@ function findModelForProvider(ctx: ExtensionContext, provider: Provider): Model<
  */
 function extractUsageFromHeaders(provider: Provider, headers: Record<string, string>): UsageData | null {
 	if (provider === "anthropic") return extractAnthropicHeaders(headers);
+	if (provider === "openai") {
+		const data = parseOpenAIUsageHeaders(headers);
+		return data ? { provider: "openai", data } : null;
+	}
 	// MiniMax and Z.ai don't expose enough header data for percentage-based status
 	return null;
 }
@@ -434,13 +501,94 @@ async function fetchMiniMaxUsage(ctx: ExtensionContext, quiet = false): Promise<
 	}
 }
 
+// ─── OpenAI subscription fetch ───────────────────────────────────────────────
+
+async function fetchOpenAIUsage(ctx: ExtensionContext, quiet = false): Promise<UsageData | null> {
+	const model = findOpenAISubscriptionModel(ctx);
+	if (!model) {
+		if (!quiet) ctx.ui.notify("No OpenAI ChatGPT subscription configured", "warning");
+		providerState.openai.lastFetchFailed = true;
+		return null;
+	}
+
+	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+	if (!auth.ok || !auth.apiKey || !ctx.modelRegistry.isUsingOAuth(model)) {
+		if (!quiet) ctx.ui.notify("OpenAI usage requires ChatGPT OAuth, not an API key", "warning");
+		providerState.openai.lastFetchFailed = true;
+		return null;
+	}
+
+	try {
+		const isLegacyCodex = model.provider === "openai-codex";
+		if (!isLegacyCodex) {
+			providerState.openai.lastFetchFailed = false;
+			providerState.openai.lastFetchTime = Date.now();
+			if (!quiet) {
+				ctx.ui.notify("OpenAI subscription limits are not exposed by native ChatGPT OAuth; usage headers will be used when available.", "info");
+			}
+			return null;
+		}
+
+		const accountId = getOpenAIAccountId(auth.apiKey);
+		if (isLegacyCodex && !accountId) {
+			if (!quiet) ctx.ui.notify("OpenAI Codex OAuth token has no ChatGPT account ID", "warning");
+			providerState.openai.lastFetchFailed = true;
+			return null;
+		}
+
+		const headers: Record<string, string> = {
+			Authorization: `Bearer ${auth.apiKey}`,
+			Accept: "application/json",
+			"User-Agent": "pi-api-usage",
+		};
+		if (accountId) headers["ChatGPT-Account-Id"] = accountId;
+		if (isLegacyCodex) headers.originator = "pi";
+
+		const usageEndpoint = getOpenAIUsageEndpoint("openai-codex");
+		if (!usageEndpoint) return null;
+		const res = await fetch(usageEndpoint, {
+			headers,
+			redirect: "error",
+		});
+		if (!res.ok) {
+			if (!quiet) {
+				const msg = res.status === 429
+					? "Rate limited while fetching OpenAI usage"
+					: `OpenAI usage fetch failed: HTTP ${res.status}`;
+				ctx.ui.notify(msg, "warning");
+			}
+			providerState.openai.lastFetchFailed = true;
+			return null;
+		}
+
+		const data = parseOpenAIUsage(await res.json());
+		if (!data) {
+			if (!quiet) ctx.ui.notify("OpenAI usage response had an unrecognized format", "warning");
+			providerState.openai.lastFetchFailed = true;
+			return null;
+		}
+
+		const usage: UsageData = { provider: "openai", data };
+		providerState.openai.lastFetchFailed = false;
+		providerState.openai.lastData = usage;
+		providerState.openai.lastAccountId = accountId;
+		providerState.openai.lastFetchTime = Date.now();
+		saveCache("openai");
+		return usage;
+	} catch (e: any) {
+		if (!quiet) ctx.ui.notify(`OpenAI usage fetch error: ${e.message}`, "warning");
+		providerState.openai.lastFetchFailed = true;
+		return null;
+	}
+}
+
 // ─── Unified fetch ───────────────────────────────────────────────────────────
 
 async function fetchUsage(ctx: ExtensionContext, provider: Provider, quiet = false): Promise<UsageData | null> {
 	if (provider === "anthropic") return fetchAnthropicUsage(ctx, quiet);
 	if (provider === "zai") return fetchZaiUsage(ctx, quiet);
 	if (provider === "minimax") return fetchMiniMaxUsage(ctx, quiet);
-	return null;
+	return fetchOpenAIUsage(ctx, quiet);
 }
 
 async function fetchAllUsage(ctx: ExtensionContext, forceFetch = false): Promise<void> {
@@ -512,9 +660,36 @@ function zaiStatusLine(data: ZaiUsageData, theme: any): string[] {
 	return [line];
 }
 
+function openAIStatusLine(data: OpenAIUsageData, theme: any): string[] {
+	const parts: string[] = [];
+	if (data.fiveHour) {
+		const pct = Math.round(data.fiveHour.pct);
+		parts.push(colorForPct(pct, theme)(`5hr: ${pct}%`));
+	}
+	if (data.weekly) {
+		const pct = Math.round(data.weekly.pct);
+		parts.push(colorForPct(pct, theme)(`7d: ${pct}%`));
+	}
+	for (const limit of data.modelLimits) {
+		if (limit.fiveHour) {
+			const pct = Math.round(limit.fiveHour.pct);
+			parts.push(colorForPct(pct, theme)(`${limit.name} 5hr: ${pct}%`));
+		}
+		if (limit.weekly) {
+			const pct = Math.round(limit.weekly.pct);
+			parts.push(colorForPct(pct, theme)(`${limit.name} 7d: ${pct}%`));
+		}
+	}
+	if (parts.length === 0) return [];
+	let line = `Usage: ${parts.join(theme.fg("dim", " │ "))}`;
+	if (providerState.openai.lastFetchFailed) line += theme.fg("dim", " (cached)");
+	return [line];
+}
+
 function statusLine(usage: UsageData, theme: any): string[] {
 	if (usage.provider === "anthropic") return anthropicStatusLine(usage.data as AnthropicUsageResponse, theme);
 	if (usage.provider === "minimax") return minimaxStatusLine(usage.data as MiniMaxUsageData, theme);
+	if (usage.provider === "openai") return openAIStatusLine(usage.data as OpenAIUsageData, theme);
 	return zaiStatusLine(usage.data as ZaiUsageData, theme);
 }
 
@@ -541,7 +716,11 @@ function updateStatus(ctx: ExtensionContext) {
 		if (providerLines.length > 0) {
 			// Prefix with provider name for clarity when multiple providers are active
 			if (providers.length > 1) {
-				const label = provider === "zai" ? "Z.ai" : provider.charAt(0).toUpperCase() + provider.slice(1);
+				const label = provider === "zai"
+						? "Z.ai"
+						: provider === "openai"
+							? "OpenAI"
+							: provider.charAt(0).toUpperCase() + provider.slice(1);
 				lines.push(...providerLines.map(l => theme.fg("dim", `[${label}] `) + l));
 			} else {
 				lines.push(...providerLines);
@@ -557,6 +736,7 @@ async function fetchAndUpdateStatus(ctx: ExtensionContext, forceFetch = false) {
 		ctx.ui.setStatus(STATUS_KEY, undefined);
 		return;
 	}
+	if (providers.includes("openai")) await prepareOpenAICache(ctx);
 	await fetchAllUsage(ctx, forceFetch);
 	updateStatus(ctx);
 }
@@ -685,12 +865,61 @@ function renderMiniMaxDetail(data: MiniMaxUsageData, theme: any, isStale: boolea
 	return lines;
 }
 
+function renderOpenAIWindow(
+	label: string,
+	window: OpenAIUsageData["fiveHour"],
+	theme: any,
+	indent = "",
+): string | undefined {
+	if (!window) return undefined;
+	const pct = Math.round(window.pct);
+	const color = colorForPct(pct, theme);
+	const bar = color(progressBar(pct));
+	const reset = window.resetsAt !== undefined
+		? theme.fg("dim", formatEpochReset(window.resetsAt))
+		: "";
+	return `${indent}${label} ${bar}  ${color(pct + "%")}  ${reset}`;
+}
+
+function renderOpenAIDetail(data: OpenAIUsageData, theme: any, isStale: boolean): string[] {
+	const lines: string[] = [];
+
+	let title = theme.bold(theme.fg("accent", "OpenAI Subscription Usage"));
+	if (data.planName) title += theme.fg("dim", `  (${data.planName})`);
+	if (isStale) {
+		const ago = Math.round((Date.now() - providerState.openai.lastFetchTime) / 60_000);
+		title += theme.fg("dim", `  (cached ${ago}m ago)`);
+	}
+	lines.push(title);
+	lines.push(theme.fg("dim", "─".repeat(30)));
+
+	const fiveHour = renderOpenAIWindow("5-Hour: ", data.fiveHour, theme);
+	const weekly = renderOpenAIWindow("7-Day:  ", data.weekly, theme);
+	if (fiveHour) lines.push(fiveHour);
+	if (weekly) lines.push(weekly);
+
+	if (data.modelLimits.length > 0) {
+		if (fiveHour || weekly) lines.push("");
+		lines.push(theme.fg("dim", "Model-specific limits:"));
+		for (const limit of data.modelLimits) {
+			lines.push(`  ${limit.name}`);
+			const modelFiveHour = renderOpenAIWindow("    5-Hour: ", limit.fiveHour, theme);
+			const modelWeekly = renderOpenAIWindow("    7-Day:  ", limit.weekly, theme);
+			if (modelFiveHour) lines.push(modelFiveHour);
+			if (modelWeekly) lines.push(modelWeekly);
+		}
+	}
+
+	return lines;
+}
+
 // ─── Extension entry point ───────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
 	loadCache("anthropic");
 	loadCache("zai");
 	loadCache("minimax");
+	loadCache("openai");
 
 	// /usage command — rich display
 	pi.registerCommand("usage", {
@@ -698,11 +927,12 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			const providers = getActiveProviders(ctx);
 			if (providers.length === 0) {
-				ctx.ui.notify("Usage tracking only supports Anthropic, Z.ai, and MiniMax models", "warning");
+				ctx.ui.notify("Usage tracking supports Anthropic, Z.ai, MiniMax, and OpenAI subscriptions", "warning");
 				return;
 			}
 
 			// Fetch fresh data for all providers
+			if (providers.includes("openai")) await prepareOpenAICache(ctx);
 			const fetchedData: { provider: Provider; data: UsageData; isStale: boolean }[] = [];
 			for (const provider of providers) {
 				const freshData = await fetchUsage(ctx, provider, false);
@@ -727,6 +957,8 @@ export default function (pi: ExtensionAPI) {
 						lines = renderAnthropicDetail(displayData.data as AnthropicUsageResponse, theme, isStale);
 					} else if (displayData.provider === "minimax") {
 						lines = renderMiniMaxDetail(displayData.data as MiniMaxUsageData, theme, isStale);
+					} else if (displayData.provider === "openai") {
+						lines = renderOpenAIDetail(displayData.data as OpenAIUsageData, theme, isStale);
 					} else {
 						lines = renderZaiDetail(displayData.data as ZaiUsageData, theme, isStale);
 					}
@@ -758,6 +990,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		const providers = getActiveProviders(ctx);
 		if (providers.length > 0) {
+			if (providers.includes("openai")) await prepareOpenAICache(ctx);
 			updateStatus(ctx);
 			await fetchAndUpdateStatus(ctx, true);
 		}
@@ -772,6 +1005,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("after_provider_response", async (event, ctx) => {
 		const provider = getCurrentProvider(ctx);
 		if (!provider) return;
+		if (provider === "openai" && (!ctx.model || !isOpenAIUsageEligible(ctx.model.provider, ctx.modelRegistry.isUsingOAuth(ctx.model)))) return;
 
 		// Only process successful responses
 		if (event.status >= 400) return;
@@ -780,6 +1014,15 @@ export default function (pi: ExtensionAPI) {
 		if (!extracted) return;
 
 		const s = providerState[provider];
+		if (extracted.provider === "openai" && s.lastData?.provider === "openai") {
+			extracted.data = {
+				...s.lastData.data,
+				...extracted.data,
+				fiveHour: extracted.data.fiveHour ?? s.lastData.data.fiveHour,
+				weekly: extracted.data.weekly ?? s.lastData.data.weekly,
+				modelLimits: s.lastData.data.modelLimits,
+			};
+		}
 		s.lastData = extracted;
 		s.lastFetchTime = Date.now();
 		s.lastFetchFailed = false;

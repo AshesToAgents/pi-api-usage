@@ -28,6 +28,7 @@ pi -e ssh://git@github.com/AshesToAgents/pi-api-usage.git
 |----------|-------------|
 | **Anthropic** | 5-hour and 7-day utilization, per-model breakdowns (Sonnet/Opus), extra usage credits |
 | **Z.ai** | Session and weekly token limits, web search quota, plan name and renewal date |
+| **OpenAI (ChatGPT subscription)** | 5-hour and weekly Codex limits, plus model-specific limits when available |
 
 ## Usage
 
@@ -59,6 +60,8 @@ Press Escape to close
 ## How It Works
 
 Usage data is cached to disk (`~/.pi/agent/data/`) so it survives restarts. If a fresh fetch fails, the last known data is displayed with a "(cached)" indicator.
+
+OpenAI subscription usage requires ChatGPT OAuth authentication. The legacy `openai-codex` provider uses the internal `chatgpt.com/backend-api/wham/usage` endpoint. Native `openai` OAuth uses a different direct-token flow for which OpenAI does not currently expose a supported subscription-quota endpoint, so it relies on any `x-codex-*` quota headers present on model responses. OpenAI API-key usage is not included.
 
 ## Development
 
